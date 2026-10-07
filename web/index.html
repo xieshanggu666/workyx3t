@@ -756,7 +756,10 @@ function writebackPanel(plan) {
   const lr = last(wb.readiness_snapshots);
   const lw = last(wb.load_windows);
   const lpre = list => [...list].reverse().slice(0, 5);
-  return `<div class="panel-card"><h3>回写（负荷分析 · 准备度 · 每日处方）</h3>
+  const archived = (wb.history || []).reduce((s, h) => s + h.daily_prescriptions.length, 0);
+  return `<div class="panel-card"><h3>回写（负荷分析 · 准备度 · 每日处方）
+      <span style="font-size:12px;color:var(--muted);font-weight:400">当前留痕归属 v${wb.version || plan.version}${wb.history && wb.history.length ? ` · 已归档 ${wb.history.length} 个旧版本（${archived} 条旧处方）` : ""}</span>
+    </h3>
     <div class="kv" style="margin-bottom:10px">
       <span>最新准备度：<b>${lr ? lr.date + " " + lr.score + " 分" : "—"}</b></span>
       <span>最新负荷窗口：<b>${lw ? lw.date_from + "~" + lw.date_to + "（实际 " + lw.actual_load + "）" : "—"}</b></span>

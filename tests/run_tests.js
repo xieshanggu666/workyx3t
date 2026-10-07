@@ -405,22 +405,63 @@ t("计划：高风险提交后挂起康复师复核，复核通过方可确认",
   assert.strictEqual(plan.status, "executing");
 });
 
-t("计划：康复师退回修改后回到草稿，须重新提交", () => {
+t("计划：康复师退回修改后回到草稿，旧复核/确认/风险全部作废须重新提交", () => {
   const plan = PL.buildPlan({ weeks: 4, increment: 0.25 });
   PL.transition(plan, "submit", { role: "coach", risk: PL.assessRisk(plan, {}) });
   PL.review(plan, { role: "therapist", decision: "request_changes", note: "增幅过大" });
   assert.strictEqual(plan.status, "draft");
-  assert.strictEqual(plan.review.status, "changes_requested");
+  assert.strictEqual(plan.review, null);
+  assert.strictEqual(plan.confirmation, null);
+  assert.strictEqual(plan.risk, null);
+  /* 时间线仍保留退回痕迹可审计 */
+  assert(plan.timeline.some(e => e.action === "review_changes"));
+  /* 重新提交后重新挂起复核，旧结论不沿用 */
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: true, level: "high", factors: [] } });
+  assert.strictEqual(plan.status, "pending_confirmation");
+  assert.strictEqual(plan.review.status, "pending");
+  assert.throws(() => PL.transition(plan, "confirm", { role: "athlete" }));
 });
 
-t("计划：暂停后恢复时若仍高风险，退回待确认复核", () => {
+t("计划：教练撤回修订作废确认与复核，修订后须重新提交确认", () => {
+  const plan = PL.buildPlan({ weeks: 4, increment: 0.25 });
+  PL.transition(plan, "submit", { role: "coach", risk: PL.assessRisk(plan, {}) });
+  PL.review(plan, { role: "therapist", decision: "approve", actor: "康复师王" });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.transition(plan, "pause", { role: "coach" });
+  PL.transition(plan, "revise", { role: "coach", actor: "李教练" });
+  assert.strictEqual(plan.status, "draft");
+  assert.strictEqual(plan.confirmation, null);
+  assert.strictEqual(plan.review, null);
+  assert.strictEqual(plan.risk, null);
+  /* 修订前的确认不能再直接执行：草稿态 confirm 非法 */
+  assert.throws(() => PL.transition(plan, "confirm", { role: "athlete" }));
+});
+
+t("计划：暂停后恢复时若仍高风险，旧确认作废并退回待确认复核", () => {
   const plan = PL.buildPlan({ weeks: 4 });
   PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
   PL.transition(plan, "confirm", { role: "athlete" });
+  assert(plan.confirmation);
   PL.transition(plan, "pause", { role: "coach" });
   PL.transition(plan, "resume", { role: "coach", risk: PL.assessRisk(PL.buildPlan({ weeks: 4, increment: 0.25 }), {}) });
   assert.strictEqual(plan.status, "pending_confirmation");
   assert.strictEqual(plan.review.status, "pending");
+  assert.strictEqual(plan.confirmation, null);
+  /* 旧确认已失效：复核未通过前禁止确认 */
+  assert.throws(() => PL.transition(plan, "confirm", { role: "athlete" }));
+});
+
+t("计划：低风险恢复写回新一轮风险评估，旧复核结论清除，可凭原确认继续", () => {
+  const plan = PL.buildPlan({ weeks: 4 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.transition(plan, "pause", { role: "coach" });
+  const fresh = { review_required: false, level: "warn", factors: [{ code: "progression", level: "warn", message: "增幅偏高" }] };
+  PL.transition(plan, "resume", { role: "coach", risk: fresh });
+  assert.strictEqual(plan.status, "executing");
+  assert.strictEqual(plan.risk.level, "warn");
+  assert.strictEqual(plan.review, null);
+  assert(plan.confirmation);
 });
 
 /* ---------- 协作计划：风险评估 ---------- */
@@ -467,25 +508,82 @@ t("执行风险：危险 ACWR 或低准备度判高并建议降级", () => {
 });
 
 /* ---------- 协作计划：回写 ---------- */
-t("回写：准备度 / 负荷窗口 / 每日处方留痕（同日覆盖）", () => {
+t("回写：准备度 / 负荷窗口 / 每日处方留痕（同日覆盖）并绑定版本", () => {
   const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 4 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
   PL.writeReadiness(plan, { date: "2026-03-09", score: 72, label: { key: "ok" } });
   PL.writeReadiness(plan, { date: "2026-03-09", score: 68 });
   assert.strictEqual(plan.writeback.readiness_snapshots.length, 1);
   assert.strictEqual(plan.writeback.readiness_snapshots[0].score, 68);
+  assert.strictEqual(plan.writeback.readiness_snapshots[0].version, 1);
   PL.writePrescription(plan, {
     date: "2026-03-09", intensity: { zone: { key: "z3", label: "节奏区" } },
     suggested_load: 400, suggested_range: [360, 440], planned_load: 400, plan_status: "planned", note: "按计划",
   });
   assert.strictEqual(plan.writeback.daily_prescriptions[0].zone, "z3");
+  assert.strictEqual(plan.writeback.daily_prescriptions[0].version, 1);
   assert.throws(() => PL.writeReadiness(plan, { date: "bad", score: 50 }));
   const actions = plan.timeline.map(e => e.action);
   assert(actions.includes("writeback_readiness"));
   assert(actions.includes("writeback_prescription"));
 });
 
+t("回写：草稿 / 待确认 / 归档态禁止写入，避免未授权或旧授权留痕", () => {
+  const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 4 });
+  assert.throws(() => PL.writeReadiness(plan, { date: "2026-03-09", score: 50 }), e => e.code === "not_writable");
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  assert.throws(() => PL.writeReadiness(plan, { date: "2026-03-09", score: 50 }), e => e.code === "not_writable");
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.writeReadiness(plan, { date: "2026-03-09", score: 50 });
+  PL.transition(plan, "archive", { role: "coach" });
+  assert.throws(() => PL.writeReadiness(plan, { date: "2026-03-10", score: 50 }), e => e.code === "not_writable");
+});
+
+t("回写：暂停态仍可写入；退回修改后旧授权下禁止再写", () => {
+  const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 4 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.transition(plan, "pause", { role: "coach" });
+  PL.writeReadiness(plan, { date: "2026-03-10", score: 55 });
+  PL.transition(plan, "revise", { role: "coach" });
+  assert.strictEqual(plan.status, "draft");
+  assert.throws(() => PL.writeReadiness(plan, { date: "2026-03-10", score: 55 }), e => e.code === "not_writable");
+});
+
+t("回写：修订生成新版本后旧留痕归档，负荷/准备度/处方只跟新版本", () => {
+  const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 4 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.writeReadiness(plan, { date: "2026-03-09", score: 70 });
+  PL.writePrescription(plan, {
+    date: "2026-03-09", intensity: { zone: { key: "z3", label: "节奏区" } },
+    suggested_load: 400, suggested_range: [360, 440], plan_status: "planned",
+  });
+  /* 高风险退回修改 → 修订计划生成 v2 */
+  PL.transition(plan, "pause", { role: "coach" });
+  PL.transition(plan, "revise", { role: "coach" });
+  PL.rebuildPlan(plan, { weeks: 6 });
+  assert.strictEqual(plan.version, 2);
+  assert.strictEqual(plan.writeback.version, 2);
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 0);
+  assert.strictEqual(plan.writeback.daily_prescriptions.length, 0);
+  assert.strictEqual(plan.writeback.history.length, 1);
+  assert.strictEqual(plan.writeback.history[0].version, 1);
+  assert.strictEqual(plan.writeback.history[0].readiness_snapshots[0].score, 70);
+  /* 重新提交确认后，新留痕归属 v2，不与 v1 混淆 */
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.writeReadiness(plan, { date: "2026-03-10", score: 61 });
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 1);
+  assert.strictEqual(plan.writeback.readiness_snapshots[0].version, 2);
+  assert.strictEqual(plan.writeback.history.length, 1);
+});
+
 t("回写：负荷窗口提取实际区间与 ACWR", () => {
   const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 4 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
   const sessions = [];
   for (let i = 0; i < 28; i++) {
     const d = new Date(2026, 1, 9 + i);
@@ -497,6 +595,7 @@ t("回写：负荷窗口提取实际区间与 ACWR", () => {
   const analysis = AN.analyzeLog({ sessions, profile: {}, plan, as_of: "2026-03-22" });
   const rec = PL.writeLoadWindow(plan, analysis);
   assert(rec.acwr != null);
+  assert.strictEqual(rec.version, 1);
   assert(rec.date_from <= "2026-03-09");
 });
 
