@@ -2,8 +2,11 @@
 /* 教练训练计划协作领域模型：
    - 角色：教练 coach / 运动员 athlete / 康复师 therapist
    - 状态流转：草稿 draft → 待确认 pending_confirmation → 执行 executing
-               ↔ 暂停 paused → 归档 archived（终态）
+               → 暂停 paused；恢复执行重新评估并回到待确认（仍高风险则重新挂起复核）
+               各活动态可归档 archived（终态）
    - 高风险时康复师强制复核（approve / request_changes）后方可执行
+   - 退回修改（revise / 复核退回）或暂停恢复时，旧确认与复核结果一律失效，
+     上一版本的负荷 / 准备度 / 处方留痕归档，避免旧授权继续执行
    - 周期计划按四周块生成（递进 + 减载），展开为每日处方
    - 负荷投影：实际历史 + 未来计划 → 投影 ACWR / 体能-疲劳
    - 回写：准备度快照、实际负荷窗口、每日处方留痕 */
@@ -52,7 +55,9 @@ const MACHINE = {
   submit: { from: ["draft"], roles: ["coach"], to: "pending_confirmation" },
   confirm: { from: ["pending_confirmation"], roles: ["athlete"], to: "executing" },
   pause: { from: ["executing"], roles: ["coach", "athlete"], to: "paused" },
-  resume: { from: ["paused"], roles: ["coach", "athlete"], to: "executing" },
+  /* 恢复须用当前负荷重新评估：一律回到待确认，旧确认 / 复核失效；
+     仍为高风险时重新挂起康复师复核（见 transition 内逻辑） */
+  resume: { from: ["paused"], roles: ["coach", "athlete"], to: "pending_confirmation" },
   revise: { from: ["pending_confirmation", "paused"], roles: ["coach"], to: "draft" },
   archive: { from: ["draft", "executing", "paused"], roles: ["coach"], to: "archived" },
 };
@@ -231,7 +236,7 @@ function buildPlan(input = {}, opts = {}) {
     risk: null,
     review: null,
     confirmation: null,
-    writeback: { readiness_snapshots: [], load_windows: [], daily_prescriptions: [] },
+    writeback: { readiness_snapshots: [], load_windows: [], daily_prescriptions: [], archives: [] },
     timeline: [
       { at: ts, actor: cfg.coach_name, role: "coach", action: "create", from: null, to: "draft", note: cfg.note || "" },
     ],
@@ -241,9 +246,11 @@ function buildPlan(input = {}, opts = {}) {
   };
 }
 
-/* 教练在草稿态修订：保留 id / 时间线 / 回写留痕，重建周期结构 */
+/* 教练在草稿态修订：保留 id / 时间线 / 归档留痕，重建周期结构；
+   生成新版本，旧确认 / 复核 / 风险失效，旧版本回写留痕归档，新确认与回写按新版本走 */
 function rebuildPlan(plan, patch, opts = {}) {
   if (plan.status !== "draft") throw new PlanError("仅草稿状态可修订，请先撤回", "not_editable");
+  const prevVersion = plan.version;
   const merged = {
     title: plan.title, athlete_name: plan.athlete_name, coach_name: plan.coach_name,
     sport: plan.sport, start_date: plan.start_date, weeks: plan.weeks,
@@ -259,6 +266,22 @@ function rebuildPlan(plan, patch, opts = {}) {
     date_end: addDays(cfg.start_date, i * 7 + 6),
   }));
   const ts = opts.now || nowISO();
+  const wb = plan.writeback || {};
+  const archives = Array.isArray(wb.archives) ? wb.archives : [];
+  const readiness = Array.isArray(wb.readiness_snapshots) ? wb.readiness_snapshots : [];
+  const loadWindows = Array.isArray(wb.load_windows) ? wb.load_windows : [];
+  const prescriptions = Array.isArray(wb.daily_prescriptions) ? wb.daily_prescriptions : [];
+  const hasTraces = readiness.length || loadWindows.length || prescriptions.length;
+  if (hasTraces) {
+    /* 旧版本留痕整批归档（仅在确有留痕时），新版本从空白留痕重新积累 */
+    archives.push({
+      version: prevVersion,
+      archived_at: ts,
+      readiness_snapshots: readiness,
+      load_windows: loadWindows,
+      daily_prescriptions: prescriptions,
+    });
+  }
   Object.assign(plan, {
     title: cfg.title,
     athlete_name: cfg.athlete_name,
@@ -277,10 +300,17 @@ function rebuildPlan(plan, patch, opts = {}) {
     risk: null,
     review: null,
     confirmation: null,
+    writeback: {
+      readiness_snapshots: [],
+      load_windows: [],
+      daily_prescriptions: [],
+      archives,
+    },
     updated_at: ts,
-    version: plan.version + 1,
+    version: prevVersion + 1,
   });
-  addTimeline(plan, { at: ts, actor: cfg.coach_name, role: "coach", action: "edit", from: "draft", to: "draft", note: patch.note || "" });
+  const editNote = [patch.note || "", hasTraces ? `v${prevVersion} 回写留痕已归档` : ""].filter(Boolean).join("；");
+  addTimeline(plan, { at: ts, actor: cfg.coach_name, role: "coach", action: "edit", from: "draft", to: "draft", note: editNote });
   return plan;
 }
 
@@ -461,6 +491,14 @@ function assertRole(rule, role) {
   }
 }
 
+/* 作废旧授权：退回修改 / 暂停恢复后，旧确认、复核结果与风险快照均不得继续生效，
+   由重新提交 / 恢复时的重新评估重新生成 */
+function invalidateAuthorization(plan) {
+  plan.confirmation = null;
+  plan.review = null;
+  plan.risk = null;
+}
+
 function transition(plan, action, params = {}) {
   const rule = MACHINE[action];
   if (!rule) throw new PlanError("未知动作：" + action);
@@ -473,30 +511,41 @@ function transition(plan, action, params = {}) {
   const from = plan.status;
 
   if (action === "submit") {
-    /* 提交即评估；高风险自动挂起康复师复核 */
+    /* 提交即评估；高风险自动挂起康复师复核。
+       退回修改后再提交时旧确认 / 复核已作废，这里再清一次兜底 */
     const risk = params.risk || assessRisk(plan, params.risk_ctx || {});
     plan.risk = risk;
+    plan.confirmation = null;
     if (risk.review_required) {
       plan.review = { required: true, status: "pending", therapist: null, note: "", reviewed_at: null };
     } else {
       plan.review = null;
     }
-    plan.confirmation = null;
   }
 
   if (action === "confirm") {
     if (plan.review && plan.review.required && plan.review.status !== "approved") {
       throw new PlanError("该计划存在高风险因素，须等待康复师复核通过后方可确认", "review_required");
     }
-    plan.confirmation = { athlete: params.actor || plan.athlete_name, confirmed_at: ts, note: params.note || "" };
+    plan.confirmation = { athlete: params.actor || plan.athlete_name, confirmed_at: ts, note: params.note || "", version: plan.version };
+  }
+
+  if (action === "revise") {
+    /* 教练撤回 / 暂停后修订：旧确认、复核与风险快照全部作废，回草稿重新走授权链 */
+    invalidateAuthorization(plan);
   }
 
   let to = rule.to;
-  if (action === "resume" && params.risk && params.risk.review_required) {
-    /* 恢复时重新评估仍为高风险：退回待确认，重新走康复师复核 */
+  if (action === "resume") {
+    /* 恢复即按当前负荷 / 准备度重新评估：旧确认与复核结果一律失效，
+       必须重新确认；仍为高风险时重新挂起康复师复核，避免旧授权继续执行 */
+    invalidateAuthorization(plan);
+    const risk = params.risk || assessRisk(plan, params.risk_ctx || {});
+    plan.risk = risk;
+    if (risk.review_required) {
+      plan.review = { required: true, status: "pending", therapist: null, note: "", reviewed_at: null };
+    }
     to = "pending_confirmation";
-    plan.risk = params.risk;
-    plan.review = { required: true, status: "pending", therapist: null, note: "", reviewed_at: null };
   }
 
   plan.status = to;
@@ -538,6 +587,7 @@ function writeReadiness(plan, entry, meta = {}) {
   if (!validDate(entry.date)) throw new PlanError("回写准备度需要合法日期");
   if (!(entry.score >= 0 && entry.score <= 100)) throw new PlanError("准备度评分须在 0-100");
   const rec = {
+    version: plan.version,
     date: entry.date,
     score: Math.round(entry.score),
     label: entry.label || null,
@@ -554,6 +604,7 @@ function writeLoadWindow(plan, analysis, meta = {}) {
   if (!days.length) throw new PlanError("负荷分析结果为空，无法回写");
   const actualDays = days.filter(d => !d.is_projected);
   const rec = {
+    version: plan.version,
     date_from: actualDays.length ? actualDays[0].date : days[0].date,
     date_to: actualDays.length ? actualDays[actualDays.length - 1].date : days[days.length - 1].date,
     sessions: analysis.totals ? analysis.totals.sessions : 0,
@@ -571,6 +622,7 @@ function writePrescription(plan, prescription, meta = {}) {
   const date = prescription.date || meta.date;
   if (!validDate(date)) throw new PlanError("回写处方需要合法日期");
   const rec = {
+    version: plan.version,
     date,
     zone: prescription.intensity ? prescription.intensity.zone.key : null,
     zone_label: prescription.intensity ? prescription.intensity.zone.label : null,

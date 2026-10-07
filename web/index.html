@@ -756,11 +756,14 @@ function writebackPanel(plan) {
   const lr = last(wb.readiness_snapshots);
   const lw = last(wb.load_windows);
   const lpre = list => [...list].reverse().slice(0, 5);
-  return `<div class="panel-card"><h3>回写（负荷分析 · 准备度 · 每日处方）</h3>
+  const archives = wb.archives || [];
+  return `<div class="panel-card"><h3>回写（负荷分析 · 准备度 · 每日处方）
+      <span style="font-size:12px;color:var(--muted);font-weight:400">当前 v${plan.version}${archives.length ? " · 已归档 " + archives.length + " 个历史版本留痕" : ""}</span>
+    </h3>
     <div class="kv" style="margin-bottom:10px">
-      <span>最新准备度：<b>${lr ? lr.date + " " + lr.score + " 分" : "—"}</b></span>
+      <span>最新准备度：<b>${lr ? lr.date + " " + lr.score + " 分（v" + (lr.version || plan.version) + "）" : "—"}</b></span>
       <span>最新负荷窗口：<b>${lw ? lw.date_from + "~" + lw.date_to + "（实际 " + lw.actual_load + "）" : "—"}</b></span>
-      <span>处方留痕：<b>${wb.daily_prescriptions.length} 条</b></span>
+      <span>处方留痕：<b>${wb.daily_prescriptions.length} 条（v${plan.version}）</b></span>
     </div>
     <div class="btn-row">
       <button class="btn ghost" data-wb="readiness" ${canAct ? "" : "disabled"}>回写当前准备度</button>
@@ -769,9 +772,12 @@ function writebackPanel(plan) {
       <button class="btn ghost" data-wb="analyze">载入计划分析视图</button>
     </div>
     <div id="wb_result" style="margin-top:10px;font-size:12.5px"></div>
-    ${lpre(wb.daily_prescriptions).length ? `<table class="tbl" style="margin-top:10px"><thead><tr><th>日期</th><th>强度区</th><th>建议负荷</th><th>执行</th></tr></thead><tbody>
-      ${lpre(wb.daily_prescriptions).map(x => `<tr><td>${x.date}</td><td>${esc(x.zone_label || "—")}</td><td>${x.suggested_load != null ? x.suggested_load : "—"}</td><td>${esc(x.plan_status)}</td></tr>`).join("")}
+    ${lpre(wb.daily_prescriptions).length ? `<table class="tbl" style="margin-top:10px"><thead><tr><th>日期</th><th>版本</th><th>强度区</th><th>建议负荷</th><th>执行</th></tr></thead><tbody>
+      ${lpre(wb.daily_prescriptions).map(x => `<tr><td>${x.date}</td><td>v${x.version != null ? x.version : plan.version}</td><td>${esc(x.zone_label || "—")}</td><td>${x.suggested_load != null ? x.suggested_load : "—"}</td><td>${esc(x.plan_status)}</td></tr>`).join("")}
     </tbody></table>` : ""}
+    ${archives.length ? `<details style="margin-top:10px"><summary style="cursor:pointer;font-size:12.5px;color:var(--muted)">历史版本留痕（${archives.length}）</summary>
+      ${[...archives].reverse().map(a => `<div style="font-size:12px;padding:4px 0">v${a.version} · 归档于 ${(a.archived_at || "").replace("T", " ").slice(0, 16)} · 准备度 ${a.readiness_snapshots.length} · 负荷窗口 ${a.load_windows.length} · 处方 ${a.daily_prescriptions.length} 条</div>`).join("")}
+    </details>` : ""}
   </div>`;
 }
 

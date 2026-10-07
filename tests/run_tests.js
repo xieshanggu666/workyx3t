@@ -367,7 +367,7 @@ t("计划：修订仅允许在草稿态，版本递增并保留时间线", () =>
 });
 
 /* ---------- 协作计划：状态机与权限 ---------- */
-t("计划：低风险可经教练提交→运动员确认→执行→暂停→恢复→归档", () => {
+t("计划：低风险经提交→确认→执行→暂停→恢复（重评重确认）→归档", () => {
   const plan = PL.buildPlan({ weeks: 4, base_load: 500, increment: 0.05 });
   PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
   assert.strictEqual(plan.status, "pending_confirmation");
@@ -377,8 +377,16 @@ t("计划：低风险可经教练提交→运动员确认→执行→暂停→�
   assert(plan.confirmation.confirmed_at);
   PL.transition(plan, "pause", { role: "athlete" });
   assert.strictEqual(plan.status, "paused");
-  PL.transition(plan, "resume", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  /* 恢复：旧确认作废、回到待确认；低风险不挂复核，重评风险落盘 */
+  PL.transition(plan, "resume", { role: "coach", risk: { review_required: false, level: "low", factors: [], evaluated_at: "re-eval" } });
+  assert.strictEqual(plan.status, "pending_confirmation");
+  assert.strictEqual(plan.confirmation, null);
+  assert.strictEqual(plan.review, null);
+  assert.strictEqual(plan.risk.evaluated_at, "re-eval");
+  assert.throws(() => PL.transition(plan, "archive", { role: "coach" })); // 待确认态不可直接归档
+  PL.transition(plan, "confirm", { role: "athlete" });
   assert.strictEqual(plan.status, "executing");
+  assert(plan.confirmation.confirmed_at);
   PL.transition(plan, "archive", { role: "coach" });
   assert.strictEqual(plan.status, "archived");
 });
@@ -413,14 +421,108 @@ t("计划：康复师退回修改后回到草稿，须重新提交", () => {
   assert.strictEqual(plan.review.status, "changes_requested");
 });
 
-t("计划：暂停后恢复时若仍高风险，退回待确认复核", () => {
+t("计划：暂停后恢复时重新评估，旧确认作废，仍高风险则重新挂起复核", () => {
   const plan = PL.buildPlan({ weeks: 4 });
   PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
   PL.transition(plan, "confirm", { role: "athlete" });
+  assert(plan.confirmation);
   PL.transition(plan, "pause", { role: "coach" });
   PL.transition(plan, "resume", { role: "coach", risk: PL.assessRisk(PL.buildPlan({ weeks: 4, increment: 0.25 }), {}) });
   assert.strictEqual(plan.status, "pending_confirmation");
   assert.strictEqual(plan.review.status, "pending");
+  assert.strictEqual(plan.confirmation, null); // 旧确认不得继续授权
+  /* 即便曾有通过记录，恢复后也必须重新复核、重新确认 */
+  assert.throws(() => PL.transition(plan, "confirm", { role: "athlete" }));
+});
+
+t("计划：撤回修订（revise）作废旧确认 / 复核 / 风险，回草稿重走授权链", () => {
+  const plan = PL.buildPlan({ weeks: 4, base_load: 500 });
+  const risk = PL.assessRisk(plan, {});
+  PL.transition(plan, "submit", { role: "coach", risk });
+  assert.strictEqual(plan.risk, risk);
+  /* 待确认态撤回：复核挂起与风险快照一并清空 */
+  PL.transition(plan, "revise", { role: "coach", actor: "李教练" });
+  assert.strictEqual(plan.status, "draft");
+  assert.strictEqual(plan.review, null);
+  assert.strictEqual(plan.confirmation, null);
+  assert.strictEqual(plan.risk, null);
+  assert(plan.timeline.some(e => e.action === "revise" && e.from === "pending_confirmation" && e.to === "draft"));
+
+  /* 暂停态撤回同样作废已确认授权 */
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.transition(plan, "pause", { role: "coach" });
+  PL.transition(plan, "revise", { role: "coach" });
+  assert.strictEqual(plan.status, "draft");
+  assert.strictEqual(plan.confirmation, null);
+  assert.strictEqual(plan.review, null);
+  assert.strictEqual(plan.risk, null);
+});
+
+t("计划：康复师退回修改保留退回意见，重新提交后以新评估为准", () => {
+  const plan = PL.buildPlan({ weeks: 4, increment: 0.25 });
+  PL.transition(plan, "submit", { role: "coach", risk: PL.assessRisk(plan, {}) });
+  PL.review(plan, { role: "therapist", decision: "request_changes", note: "增幅过大" });
+  assert.strictEqual(plan.status, "draft");
+  assert.strictEqual(plan.review.status, "changes_requested");
+  /* 教练调整为低风险后重新提交：旧退回意见被新评估覆盖，不再拦确认 */
+  plan.increment = 0.05;
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  assert.strictEqual(plan.review, null);
+  PL.transition(plan, "confirm", { role: "athlete" });
+  assert.strictEqual(plan.status, "executing");
+});
+
+t("计划：暂停恢复（低风险）后重新确认，确认记录绑定当前版本", () => {
+  const plan = PL.buildPlan({ weeks: 4, increment: 0.05 });
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete", actor: "张运动员" });
+  PL.transition(plan, "pause", { role: "coach" });
+  PL.transition(plan, "resume", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete", actor: "张运动员" });
+  assert.strictEqual(plan.status, "executing");
+  assert.strictEqual(plan.confirmation.version, plan.version);
+  assert.strictEqual(plan.confirmation.athlete, "张运动员");
+});
+
+t("计划：修订生成新版本时，旧版本回写留痕归档并按版本重置", () => {
+  const plan = PL.buildPlan({ start_date: "2026-03-09", weeks: 4 });
+  PL.writeReadiness(plan, { date: "2026-03-09", score: 72 });
+  PL.writePrescription(plan, {
+    date: "2026-03-09", intensity: { zone: { key: "z3", label: "节奏区" } },
+    suggested_load: 400, suggested_range: [360, 440], planned: { planned_load: 400 }, plan_status: "planned",
+  });
+  assert.strictEqual(plan.writeback.readiness_snapshots[0].version, 1);
+  /* 待确认态撤回修订 → 草稿态 rebuildPlan 产生 v2 */
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "revise", { role: "coach" });
+  PL.rebuildPlan(plan, { weeks: 6 });
+  assert.strictEqual(plan.version, 2);
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 0);
+  assert.strictEqual(plan.writeback.daily_prescriptions.length, 0);
+  assert.strictEqual(plan.writeback.archives.length, 1);
+  const arc = plan.writeback.archives[0];
+  assert.strictEqual(arc.version, 1);
+  assert.strictEqual(arc.readiness_snapshots.length, 1);
+  assert.strictEqual(arc.daily_prescriptions.length, 1);
+  /* 新版本留痕重新积累，标记为 v2；历史归档不被覆盖 */
+  PL.transition(plan, "submit", { role: "coach", risk: { review_required: false, level: "low", factors: [] } });
+  PL.transition(plan, "confirm", { role: "athlete" });
+  PL.writeReadiness(plan, { date: "2026-03-10", score: 65 });
+  assert.strictEqual(plan.writeback.readiness_snapshots.length, 1);
+  assert.strictEqual(plan.writeback.readiness_snapshots[0].version, 2);
+  assert.strictEqual(plan.writeback.archives.length, 1);
+});
+
+t("计划：无留痕的修订不产生空归档，多版本连续归档", () => {
+  const plan = PL.buildPlan({ weeks: 4 });
+  PL.rebuildPlan(plan, { weeks: 5 }); // v1 无留痕
+  assert.strictEqual(plan.writeback.archives.length, 0);
+  PL.writeReadiness(plan, { date: "2026-03-09", score: 70 });
+  PL.rebuildPlan(plan, { weeks: 6 }); // v2 有留痕 → 归档
+  assert.strictEqual(plan.version, 3);
+  assert.strictEqual(plan.writeback.archives.length, 1);
+  assert.strictEqual(plan.writeback.archives[0].version, 2);
 });
 
 /* ---------- 协作计划：风险评估 ---------- */
